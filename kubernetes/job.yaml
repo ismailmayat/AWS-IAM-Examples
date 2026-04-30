@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: confluent-producer-job
+  namespace: confluent-producer
+  labels:
+    app: confluent-producer
+spec:
+  # Run once and complete
+  completions: 1
+  parallelism: 1
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: confluent-producer
+    spec:
+      serviceAccountName: confluent-producer-sa
+      restartPolicy: OnFailure
+      containers:
+      - name: producer
+        # This will be automatically replaced by deploy.sh with your actual AWS account ID
+        image: YOUR_AWS_ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com/confluent-producer:latest
+        imagePullPolicy: Always
+        envFrom:
+        - configMapRef:
+            name: confluent-producer-config
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL

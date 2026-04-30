@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: confluent-producer
+  namespace: confluent-producer
+  labels:
+    app: confluent-producer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: confluent-producer
+  template:
+    metadata:
+      labels:
+        app: confluent-producer
+    spec:
+      serviceAccountName: confluent-producer-sa
+      containers:
+      - name: producer
+        # This will be automatically replaced by deploy.sh with your actual AWS account ID
+        image: YOUR_AWS_ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com/confluent-producer:latest
+        imagePullPolicy: Always
+        envFrom:
+        - configMapRef:
+            name: confluent-producer-config
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+      restartPolicy: Always

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: confluent-producer-config
+  namespace: confluent-producer
+data:
+  # Confluent Cloud cluster settings
+  # Replace with your actual Confluent Cloud bootstrap server
+  BOOTSTRAP_SERVERS: "pkc-xxxxx.us-west-2.aws.confluent.cloud:9092"
+  # Replace with your actual Confluent Cloud logical cluster ID
+  LOGICAL_CLUSTER: "lkc-xxxxxx"
+  # Replace with your desired Kafka topic name
+  KAFKA_TOPIC: "test_topic"
+
+  # AWS settings
+  # Replace with your actual AWS account ID (12-digit number)
+  AWS_ACCOUNT_ID: "123456789012"
+  AWS_DEFAULT_REGION: "us-west-2"
+
+  # Producer settings
+  MESSAGE_COUNT: "100"
