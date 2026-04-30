@@ -1,15 +1,6 @@
 # Quick Start Guide
 
-Get up and running in 30 minutes!
-
-## ⚠️ Cost Warning
-
-This example creates billable AWS resources:
-- **Hourly Cost:** ~$0.33/hour (~$8/day)
-- **Monthly Cost:** ~$237/month if left running
-- **Largest Cost:** NAT Gateways ($99/month)
-
-💡 **Remember to clean up when done!** See [Cleanup](README.md#cleanup) in the README.
+Note this example creates billable AWS resources; remember to clean up when done.
 
 ## Prerequisites Checklist
 
@@ -25,13 +16,13 @@ This example creates billable AWS resources:
 This example will create the following AWS resources:
 
 ### Billable Resources
-| Resource | Quantity | Cost/Hour | Cost/Month |
-|----------|----------|-----------|------------|
-| EKS Control Plane | 1 cluster | $0.10 | ~$73 |
-| EC2 Instances (t3.medium) | 2 nodes | $0.08 | ~$61 |
-| NAT Gateways | 3 (one per AZ) | $0.14 | ~$99 |
-| EBS Volumes (gp3) | ~40 GB total | - | ~$3 |
-| **TOTAL** | - | **~$0.33** | **~$237** |
+| Resource | Quantity | Cost/Hour | 
+|----------|----------|-----------|
+| EKS Control Plane | 1 cluster | $0.10 |
+| EC2 Instances (t3.medium) | 2 nodes | $0.08 |
+| NAT Gateways | 3 (one per AZ) | $0.14 |
+| EBS Volumes (gp3) | ~40 GB total | - |
+| **TOTAL** | - | **~$0.33** |
 
 ### Free/Minimal Cost Resources
 - IAM Role and Policies (free)
@@ -39,10 +30,6 @@ This example will create the following AWS resources:
 - ECR Repository (~$0.10/GB for storage, ~$0.02/month for this image)
 - VPC, Subnets, Route Tables, Security Groups (free)
 
-### Cost Optimization Tips
-- Use 1 NAT gateway instead of 3 (saves ~$66/month, but less resilient)
-- Use spot instances for worker nodes (saves ~$40/month, but can be terminated)
-- Delete resources immediately after testing (see [Cleanup](README.md#cleanup))
 
 ## Step-by-Step Setup
 
