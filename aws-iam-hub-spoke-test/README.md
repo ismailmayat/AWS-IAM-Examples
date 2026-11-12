@@ -38,6 +38,7 @@ sequenceDiagram
 | `terraform/spoke.tf` | The runtime role (allowed only to assume the hub role), the Lambda layer and the function. |
 | `terraform/confluent.tf` | An AWS IAM identity provider for the hub issuer, an identity pool filtered on the exact hub role ARN, and `DeveloperRead` role bindings. |
 | `terraform/tags.tf` | The `tags` variable, applied to every AWS resource through `default_tags`. |
+| `terraform/esm.tf`, `handler_esm.py` | Optional ESM variant (`enable_esm_test`): a Lambda with the native Kafka trigger, expected to fail against the hub pool. See [ESM variant](#esm-variant-expected-to-fail). |
 
 ## Prerequisites
 
@@ -90,8 +91,68 @@ logs() { aws logs tail "/aws/lambda/$FN" --since 5m --format short "$@"; }
 
 Things to read in the logs:
 
-- **`caller_identity` lines:** these show how the hop behaves in Lambda. The line logged `via=default chain (AWS_PROFILE env var only)` shows whether `AWS_PROFILE` on its own gives hub-role credentials. Lambda also sets its own credentials as environment variables, and the SDK may use those first. The line logged `via=explicit profile` shows what an explicit `boto3.Session(profile_name=...)` returns. The handler always mints tokens through the explicit profile.
+- **`caller_identity` lines:** these show how the hop behaves in Lambda. The line logged `via=default chain (AWS_PROFILE env var only)` shows whether `AWS_PROFILE` on its own gives hub-role credentials. Expect it to show the Lambda execution role: Lambda sets its own credentials as environment variables, and boto3 uses those before the profile. The line logged `via=explicit profile` shows what an explicit `boto3.Session(profile_name=...)` returns. The handler always mints tokens through the explicit profile.
 - **`token_minted.claims["https://sts.amazonaws.com/"]`:** check whether the hub role's tags (`source-account`, `workload`, `environment`, `owner`) appear in the token as principal tags. If your `tags` variable already has one of these keys in a different case (for example `Owner`), the hub role uses that spelling, because IAM tag keys are case-insensitive.
+
+## ESM variant (expected to fail)
+
+This shows that the Lambda native Kafka trigger (event source mapping, ESM) can't use the hub. It deploys a second Lambda in the "spoke" with an ESM using `IAM_OAUTHBEARER_AUTH`, pointed at the **same hub identity pool**. The hub pool also gets `DeveloperRead` on the ESM's consumer group, so the only thing that can fail is identity.
+
+```mermaid
+sequenceDiagram
+    participant ESM as Lambda ESM<br/>(spoke execution role)
+    participant STS as AWS STS
+    participant CC as Confluent Cloud
+
+    Note over ESM: IAM_OAUTHBEARER_AUTH has no setting<br/>to assume the hub role first
+    ESM->>STS: GetWebIdentityToken as the execution role<br/>aud = confluent-cloud-kafka
+    STS-->>ESM: JWT, sub = spoke execution role ARN
+    ESM->>CC: SASL_SSL / OAUTHBEARER<br/>JWT only (no logicalCluster / identityPoolId)
+    Note over CC: hub pool filter: sub == hub role ARN<br/>→ no pool matches
+    CC-->>ESM: SASL authentication failed
+```
+
+Deploy it alongside the main test:
+
+```bash
+terraform apply -var enable_esm_test=true
+```
+
+Then collect the evidence:
+
+```bash
+ESM_FN=$(terraform output -raw esm_function_name)
+
+# 1. The ESM's state and last result: expect an authentication failure, not "OK"
+aws lambda get-event-source-mapping --uuid "$(terraform output -raw esm_uuid)" \
+  --query '{State:State,LastProcessingResult:LastProcessingResult,StateTransitionReason:StateTransitionReason}'
+
+# 2. Why: mint a token exactly the way the ESM does (execution role, same audience)
+out=$(mktemp); aws lambda invoke --function-name "$ESM_FN" --payload '{}' \
+  --cli-binary-format raw-in-base64-out "$out" >/dev/null && cat "$out"; echo; rm -f "$out"
+```
+
+Expected from step 2:
+
+```json
+{
+  "caller": "arn:aws:sts::<account>:assumed-role/dev-lambda-consumer-esm-runtime-…/dev-lambda-consumer-esm-hubtest",
+  "token_sub": "arn:aws:iam::<account>:role/dev-lambda-consumer-esm-runtime-…",
+  "hub_pool_expects_sub": "arn:aws:iam::<account>:role/kafka/dev-lambda-consumer",
+  "matches_hub_pool": false
+}
+```
+
+In the function's logs (`aws logs tail /aws/lambda/$ESM_FN`), a line `UNEXPECTED_SUCCESS` would mean the ESM got records, which shouldn't happen.
+
+What this shows, and its limits:
+
+- **The ESM's token identity is the execution role.** The role is also allowed to assume the hub role, and the ESM still doesn't use it. No ESM setting changes this.
+- **In this single-account test the issuer matches**, because hub and spoke are the same account, so the failure happens at the identity pool filter. In a real spoke account it fails earlier: outbound federation isn't enabled there (and the root SCP in the design denies it), so `GetWebIdentityToken` is denied, or the token carries an issuer Confluent Cloud doesn't trust.
+- **No SASL extensions:** this mode sends neither `logicalCluster` nor `identityPoolId`.
+- **Terraform note:** AWS requires the `IAM_OAUTHBEARER_AUTH` entry to have no URI, while the Terraform AWS provider marks `uri` as required. `esm.tf` sets `uri = ""`, which the provider leaves out of the API request. If a provider version rejects this, create the mapping with `aws lambda create-event-source-mapping` instead.
+
+Turn it off again with `terraform apply -var enable_esm_test=false`.
 
 ## Clean up
 

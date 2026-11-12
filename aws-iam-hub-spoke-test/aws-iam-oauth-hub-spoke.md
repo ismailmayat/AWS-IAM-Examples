@@ -144,6 +144,8 @@ One audience, capped lifetime, no caller-supplied tags (no `sts:TagGetWebIdentit
 
 Tag every hub role with `source-account`, `workload`, `environment` and `owner` (see [Naming and tags](#naming-and-tags)). They appear in the token as principal tags and keep the original account visible in audit, which the `aws_account` claim no longer shows.
 
+**Every tag on the hub role is copied into every token** (verified), including tags applied automatically by the pipeline, such as Terraform provider `default_tags` or organization tag policies. Tokens go to Confluent Cloud, so keep hub role tags minimal and free of personal or internal data, for example by not applying blanket default tags to hub roles.
+
 ### Confluent identity pool
 
 - Identity claim: `claims.sub`.
@@ -162,7 +164,7 @@ Application code never assumes the hub role itself: the platform (EKS) or the AW
 | ECS / Fargate | Shared config profile: `role_arn` = hub role, `credential_source = EcsContainer`; set `AWS_PROFILE`. | None |
 | EC2 | Same profile with `credential_source = Ec2InstanceMetadata`. | None |
 | Lambda consumer (native Kafka trigger, ESM) | Not possible: the ESM can't assume the hub role. See below. | n/a |
-| Lambda producer, or self-polling consumer (not recommended) | Same profile with `credential_source = Environment`. | Possibly: Lambda sets its own credentials as environment variables, which can take priority over `AWS_PROFILE` in the SDK credential chain. In Python, use an explicit `boto3.Session(profile_name="kafka-hub")`. The test in this folder logs which identity each approach resolves to. |
+| Lambda producer, or self-polling consumer (not recommended) | Same profile with `credential_source = Environment`. | Yes (Python, verified): Lambda sets its own credentials as environment variables, and with only `AWS_PROFILE` set the SDK uses those, so the hop silently doesn't happen. Use an explicit `boto3.Session(profile_name="kafka-hub")`. Check other SDKs the same way. |
 
 ### Lambda consumers: the native Kafka trigger (ESM) is the recommended way, and it can't use the hub
 
@@ -346,7 +348,16 @@ ECS and EKS are the best fit for this design. Your own code runs the Kafka clien
 | Onboarding volume | Many workloads mean many changes | One pipeline entry per workload creates the hub role, the pool, the RBAC bindings, and the association or profile (see Onboarding). |
 | AWS-managed Kafka clients | Services that connect to Kafka with their own identity can't do the hop | The Lambda native trigger (ESM) is the known case. Check any other managed service before assuming hub support. |
 
-**Validation:** the single-account test in this folder ([README](README.md)) covers the role hop, token claims, the audience and duration caps, the `sub` filter and RBAC. Before rolling out, also test a cross-account EKS Pod Identity target role and the ECS profile hop with a second account in the organization, running a small EKS or ECS workload.
+**Validation:** the single-account test in this folder ([README](README.md)) covers the role hop, token claims, the audience and duration caps, the `sub` filter and RBAC. Results from running it:
+
+| Check | Result |
+| --- | --- |
+| Hop + mint + consume (self-polling test Lambda) | Works: `sub` = `arn:aws:iam::<account>:role/kafka/dev-lambda-consumer`, records consumed through the hub pool |
+| `AWS_PROFILE` alone in Lambda (Python) | Resolves to the Lambda execution role, not the hub role; an explicit profile session is needed |
+| Principal tags | All hub role tags, including default tags, appear in the token |
+| Lambda native trigger (ESM) with `IAM_OAUTHBEARER_AUTH` against the hub pool | Fails: `PROBLEM: SASL authentication failed`. The token's `sub` is the ESM's execution role, not the hub role, even when that role is allowed to assume the hub role |
+
+Before rolling out, also test a cross-account EKS Pod Identity target role and the ECS profile hop with a second account in the organization, running a small EKS or ECS workload.
 
 ## Trade-offs and open questions
 
