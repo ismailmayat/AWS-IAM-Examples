@@ -2,6 +2,23 @@
 
 A simple, complete example of using AWS IAM authentication with Confluent Cloud from Amazon EKS. This is example code for educational purposes.
 
+## Repository Contents
+
+This README walks through the **EKS producer** example in the repository root. The repository also contains:
+
+| Path | What it is |
+| --- | --- |
+| [`aws-iam-hub-spoke-test/aws-iam-oauth-hub-spoke.md`](aws-iam-hub-spoke-test/aws-iam-oauth-hub-spoke.md) | Design: a hub-and-spoke layout where many AWS accounts get their Confluent Cloud tokens through **one** token-minting hub account, so Confluent trusts a single AWS IAM identity provider. Covers ECS/EKS wiring, Lambda consumers, guardrails, scaling limits and operations. |
+| [`aws-iam-hub-spoke-test/`](aws-iam-hub-spoke-test/README.md) | A single-account Terraform test of that design: a hub role under `/kafka/` with audience and duration caps, a runtime role that assumes it, a Confluent identity pool pinned to the hub role ARN, and a test Lambda that logs the decoded token claims. |
+| [`lambda-entra-consumer/`](lambda-entra-consumer/README.md) | A Lambda consumer using the native Lambda Kafka trigger (event source mapping) with **Azure Entra ID** OAuth (client credentials), deployed with Terraform. This is the recommended Lambda consumer pattern where the AWS IAM hub can't be used. |
+
+Which authentication fits which compute:
+
+| Compute | Recommended authentication |
+| --- | --- |
+| EKS, ECS, EC2 (your own Kafka client) | AWS IAM OAuth. Use the hub-and-spoke layout once there are multiple AWS accounts. |
+| Lambda consumer | The native Kafka trigger (event source mapping), which can't assume a hub role. Use an external IdP such as Entra ID (`lambda-entra-consumer/`), or per-account AWS IAM federation. |
+
 ## What This Example Demonstrates
 
 - Python Kafka producer running on Amazon EKS
@@ -24,6 +41,9 @@ A simple, complete example of using AWS IAM authentication with Confluent Cloud 
   - **`configmap.yaml`** - Application configuration
   - **`job.yaml`** - One-time job deployment
   - **`deployment.yaml`** - Continuous deployment
+- **`lambda-entra-consumer/`** - Separate example: Lambda consumer with Entra ID OAuth (see [Repository Contents](#repository-contents))
+- **`aws-iam-hub-spoke-test/aws-iam-oauth-hub-spoke.md`** - Hub-and-spoke design for many AWS accounts
+- **`aws-iam-hub-spoke-test/`** - Single-account test of the hub-and-spoke design
 
 ## What This Example Produces
 
@@ -68,275 +88,81 @@ For a production streaming application, you'd modify `producer.py` to run in a c
 
 ### High-Level Overview
 
-```
-┌─────────────────────────────────────────────────────────┐
-│ Amazon EKS Cluster                                      │
-│                                                         │
-│  ┌──────────────────────────────────────────┐          │
-│  │ Pod: Confluent Producer                  │          │
-│  │                                           │          │
-│  │ 1. Get AWS IAM token from STS ────────┐  │          │
-│  │    (via EKS Pod Identity)             │  │          │
-│  │                                       │  │          │
-│  │ 2. Use token for OAuth with          │  │          │
-│  │    Confluent Cloud ────────────────┐ │  │          │
-│  │                                    │ │  │          │
-│  │ 3. Produce messages                │ │  │          │
-│  └────────────────────────────────────┼─┼──┘          │
-│                                       │ │              │
-└───────────────────────────────────────┼─┼──────────────┘
-                                        │ │
-                                        │ └──> AWS STS
-                                        │      (GetWebIdentityToken)
-                                        │
-                                        └────> Confluent Cloud
-                                               (Kafka Cluster)
+```mermaid
+flowchart LR
+    subgraph EKS["Amazon EKS Cluster"]
+        Pod["Pod: Confluent Producer<br/>(producer.py)"]
+    end
+    STS["AWS STS<br/>GetWebIdentityToken"]
+    CC["Confluent Cloud<br/>Kafka Cluster"]
+
+    Pod -- "1. Get AWS IAM token<br/>(credentials from EKS Pod Identity)" --> STS
+    STS -- "signed JWT" --> Pod
+    Pod -- "2. OAuth (SASL OAUTHBEARER) with the JWT<br/>3. Produce messages" --> CC
 ```
 
 ### Detailed Authentication Workflow
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PI as EKS Pod Identity
+    participant P as producer.py<br/>(confluent-kafka)
+    participant STS as AWS STS
+    participant CC as Confluent Cloud<br/>Kafka broker
+    participant JWKS as AWS OIDC endpoint<br/>/.well-known/jwks.json
+
+    Note over PI,P: Step 1: Pod initialization
+    PI->>P: Inject AWS credentials<br/>(namespace confluent-producer,<br/>service account confluent-producer-sa)
+
+    Note over P,STS: Step 2: Request AWS IAM token
+    P->>STS: get_web_identity_token(Audience=[AWS_ACCOUNT_ID],<br/>SigningAlgorithm=ES384, DurationSeconds=3600)
+    STS->>STS: Validate the pod's identity and IAM role permissions
+    STS-->>P: JWT signed with the AWS private key
+
+    Note over P,CC: Step 3: Connect with OAuth
+    P->>CC: SASL_SSL / OAUTHBEARER<br/>Bearer = JWT, extension logicalCluster=lkc-xxxxx
+
+    Note over CC,JWKS: Step 4: Token validation
+    CC->>CC: Read iss, find the identity provider with that issuer
+    CC->>JWKS: GET jwks.json (cached)
+    JWKS-->>CC: AWS public keys
+    CC->>CC: Verify signature, exp and aud, extract sub
+
+    Note over CC: Step 5: Identity pool mapping<br/>Pool under that provider whose filter matches the token
+    Note over CC: Step 6: RBAC<br/>Role bindings of the pool, e.g. CloudClusterAdmin<br/>or DeveloperWrite on test_topic
+
+    Note over P,CC: Step 7: Produce messages
+    P->>CC: produce(topic=test_topic, key=key-1, value={"msg": "hello"})
+    CC-->>P: Ack: delivered to test_topic[0] @ offset 42
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│ STEP 1: Pod Initialization                                                │
-│ ───────────────────────────────────────────────────────────────────────    │
-│                                                                            │
-│  ┌─────────────────────────────────────────┐                              │
-│  │ EKS Pod (Confluent Producer)            │                              │
-│  │ • Namespace: confluent-producer         │                              │
-│  │ • ServiceAccount: confluent-producer-sa │                              │
-│  │ • producer.py running                   │                              │
-│  └──────────────────┬──────────────────────┘                              │
-│                     │                                                      │
-│                     │ EKS Pod Identity automatically                       │
-│                     │ injects AWS credentials                              │
-│                     ↓                                                      │
-│  ┌─────────────────────────────────────────┐                              │
-│  │ AWS Credentials Available in Pod        │                              │
-│  │ • AWS_REGION                            │                              │
-│  │ • AWS_ROLE_ARN                          │                              │
-│  │ • AWS_WEB_IDENTITY_TOKEN_FILE           │                              │
-│  └─────────────────────────────────────────┘                              │
-└────────────────────────────────────────────────────────────────────────────┘
 
-┌────────────────────────────────────────────────────────────────────────────┐
-│ STEP 2: Request AWS IAM Token                                             │
-│ ───────────────────────────────────────────────────────────────────────    │
-│                                                                            │
-│  ┌─────────────────────────────────────────┐                              │
-│  │ producer.py                             │                              │
-│  │                                         │                              │
-│  │ boto3.client('sts')                     │                              │
-│  │   .get_web_identity_token(              │                              │
-│  │     Audience=[AWS_ACCOUNT_ID],          │                              │
-│  │     SigningAlgorithm='ES384',           │                              │
-│  │     DurationSeconds=3600                │                              │
-│  │   )                                     │                              │
-│  └──────────────────┬──────────────────────┘                              │
-│                     │                                                      │
-│                     │ HTTPS Request                                        │
-│                     ↓                                                      │
-│  ┌─────────────────────────────────────────┐                              │
-│  │ AWS STS (Security Token Service)        │                              │
-│  │ • Validates pod identity                │                              │
-│  │ • Validates IAM role permissions        │                              │
-│  │ • Signs JWT token with AWS private key  │                              │
-│  └──────────────────┬──────────────────────┘                              │
-│                     │                                                      │
-│                     │ Returns signed JWT                                   │
-│                     ↓                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ JWT Token (Simplified Example)                                      │  │
-│  │ ────────────────────────────────────────────────────────────────    │  │
-│  │ Header:                                                              │  │
-│  │   {                                                                  │  │
-│  │     "alg": "ES384",                                                  │  │
-│  │     "kid": "abcd1234...",                                            │  │
-│  │     "typ": "JWT"                                                     │  │
-│  │   }                                                                  │  │
-│  │                                                                      │  │
-│  │ Payload:                                                             │  │
-│  │   {                                                                  │  │
-│  │     "iss": "https://UUID.tokens.sts.global.api.aws",                │  │
-│  │     "sub": "123456789012",              ← Your AWS Account ID       │  │
-│  │     "aud": ["123456789012"],                                         │  │
-│  │     "exp": 1234567890,                                               │  │
-│  │     "iat": 1234564290                                                │  │
-│  │   }                                                                  │  │
-│  │                                                                      │  │
-│  │ Signature: [signed by AWS private key]                              │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────────────┘
+The JWT returned by STS in step 2 looks like this (simplified):
 
-┌────────────────────────────────────────────────────────────────────────────┐
-│ STEP 3: Connect to Confluent Cloud with OAuth                             │
-│ ───────────────────────────────────────────────────────────────────────    │
-│                                                                            │
-│  ┌─────────────────────────────────────────┐                              │
-│  │ Kafka Producer (confluent-kafka)        │                              │
-│  │                                         │                              │
-│  │ Producer.connect() with:                │                              │
-│  │ • security.protocol: SASL_SSL           │                              │
-│  │ • sasl.mechanisms: OAUTHBEARER          │                              │
-│  │ • oauth_cb: returns AWS IAM token       │                              │
-│  │                                         │                              │
-│  └──────────────────┬──────────────────────┘                              │
-│                     │                                                      │
-│                     │ TLS Connection with SASL OAUTHBEARER                 │
-│                     │ Bearer Token: <JWT from Step 2>                      │
-│                     │ Extensions: logicalCluster=lkc-xxxxx                 │
-│                     ↓                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ Confluent Cloud - Kafka Broker                                      │  │
-│  │ • Receives connection with OAuth token                              │  │
-│  │ • Extracts JWT token                                                │  │
-│  │ • Reads "iss" (issuer) from token                                   │  │
-│  └──────────────────┬──────────────────────────────────────────────────┘  │
-│                     │                                                      │
-│                     ↓                                                      │
-└────────────────────────────────────────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────────────────────┐
-│ STEP 4: Token Validation                                                  │
-│ ───────────────────────────────────────────────────────────────────────    │
-│                                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ Confluent Cloud - Identity Provider Lookup                          │  │
-│  │                                                                      │  │
-│  │ 1. Extract issuer from JWT:                                         │  │
-│  │    iss = "https://UUID.tokens.sts.global.api.aws"                   │  │
-│  │                                                                      │  │
-│  │ 2. Find matching Identity Provider:                                 │  │
-│  │    → Lookup provider with matching issuer URL                       │  │
-│  │    → Found: "AWS IAM" provider                                      │  │
-│  │                                                                      │  │
-│  │ 3. Get JWKS (public keys) from provider:                            │  │
-│  │    → Fetch: https://UUID.tokens.sts.global.api.aws/                 │  │
-│  │              .well-known/jwks.json                                   │  │
-│  │    → Cache public keys                                              │  │
-│  └──────────────────┬──────────────────────────────────────────────────┘  │
-│                     │                                                      │
-│                     │ HTTPS GET                                            │
-│                     ↓                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ AWS OIDC Endpoint (Managed by AWS)                                  │  │
-│  │ https://UUID.tokens.sts.global.api.aws/.well-known/jwks.json        │  │
-│  │                                                                      │  │
-│  │ Returns:                                                             │  │
-│  │ {                                                                    │  │
-│  │   "keys": [                                                          │  │
-│  │     {                                                                │  │
-│  │       "kid": "abcd1234...",                                          │  │
-│  │       "kty": "EC",                                                   │  │
-│  │       "use": "sig",                                                  │  │
-│  │       "crv": "P-384",                                                │  │
-│  │       "x": "...",                                                    │  │
-│  │       "y": "..."                        ← AWS public key            │  │
-│  │     }                                                                │  │
-│  │   ]                                                                  │  │
-│  │ }                                                                    │  │
-│  └──────────────────┬──────────────────────────────────────────────────┘  │
-│                     │                                                      │
-│                     │ Public key returned                                  │
-│                     ↓                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ Confluent Cloud - Verify JWT Signature                              │  │
-│  │                                                                      │  │
-│  │ ✓ Verify signature using AWS public key                             │  │
-│  │ ✓ Verify token not expired (exp claim)                              │  │
-│  │ ✓ Verify audience matches (aud claim)                               │  │
-│  │ ✓ Extract subject: sub = "123456789012"                             │  │
-│  │                         └─ This is the AWS Account ID               │  │
-│  └──────────────────┬──────────────────────────────────────────────────┘  │
-│                     │                                                      │
-│                     ↓                                                      │
-└────────────────────────────────────────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────────────────────┐
-│ STEP 5: Identity Pool Mapping                                             │
-│ ───────────────────────────────────────────────────────────────────────    │
-│                                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ Confluent Cloud - Find Identity Pool                                │  │
-│  │                                                                      │  │
-│  │ Token sub (subject) = "123456789012"                                │  │
-│  │                                                                      │  │
-│  │ Look for Identity Pool where:                                       │  │
-│  │ • Provider = "AWS IAM" (from issuer match)                          │  │
-│  │ • Pool ID = "123456789012" (matches token subject)                  │  │
-│  │ • Filter = <empty> (accepts all tokens from provider)               │  │
-│  │                                                                      │  │
-│  │ ✓ Found matching pool!                                              │  │
-│  └──────────────────┬──────────────────────────────────────────────────┘  │
-│                     │                                                      │
-│                     ↓                                                      │
-└────────────────────────────────────────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────────────────────┐
-│ STEP 6: Check Permissions (RBAC)                                          │
-│ ───────────────────────────────────────────────────────────────────────    │
-│                                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ Confluent Cloud - Role Binding Check                                │  │
-│  │                                                                      │  │
-│  │ Check role bindings for:                                            │  │
-│  │ • Principal: Identity Pool "123456789012"                           │  │
-│  │ • Resource: Topic "test_topic"                                      │  │
-│  │ • Cluster: lkc-xxxxx                                                │  │
-│  │ • Operation: WRITE (produce messages)                               │  │
-│  │                                                                      │  │
-│  │ Role Binding Found:                                                 │  │
-│  │ • Role: CloudClusterAdmin                                           │  │
-│  │ • Allows: All operations on all topics                              │  │
-│  │                                                                      │  │
-│  │ ✓ Authorization successful!                                         │  │
-│  └──────────────────┬──────────────────────────────────────────────────┘  │
-│                     │                                                      │
-│                     ↓                                                      │
-└────────────────────────────────────────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────────────────────┐
-│ STEP 7: Produce Messages                                                  │
-│ ───────────────────────────────────────────────────────────────────────    │
-│                                                                            │
-│  ┌─────────────────────────────────────────┐                              │
-│  │ Kafka Producer                          │                              │
-│  │                                         │                              │
-│  │ producer.produce(                       │                              │
-│  │   topic='test_topic',                   │                              │
-│  │   key='key-1',                          │                              │
-│  │   value='{"msg": "hello"}'              │                              │
-│  │ )                                       │                              │
-│  └──────────────────┬──────────────────────┘                              │
-│                     │                                                      │
-│                     │ Kafka Protocol (over authenticated connection)       │
-│                     ↓                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ Confluent Cloud - Kafka Broker                                      │  │
-│  │                                                                      │  │
-│  │ • Receives message                                                  │  │
-│  │ • Appends to topic partition                                        │  │
-│  │ • Returns acknowledgment                                            │  │
-│  │                                                                      │  │
-│  │ ✓ Message stored at offset 42                                       │  │
-│  └──────────────────┬──────────────────────────────────────────────────┘  │
-│                     │                                                      │
-│                     │ Success response                                     │
-│                     ↓                                                      │
-│  ┌─────────────────────────────────────────┐                              │
-│  │ Producer receives acknowledgment        │                              │
-│  │ ✅ Message delivered to topic[0] @42    │                              │
-│  └─────────────────────────────────────────┘                              │
-└────────────────────────────────────────────────────────────────────────────┘
-
-Key Points:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• No API keys or secrets stored anywhere
-• AWS credentials automatically managed by EKS Pod Identity
-• JWT tokens are short-lived (15-60 minutes) and auto-refreshed
-• Token validation happens via standard OIDC/OAuth flow
-• Identity pools map AWS accounts to Kafka permissions
-• All authentication handled transparently by the Kafka client
+```json
+{
+  "header":  { "alg": "ES384", "kid": "abcd1234...", "typ": "JWT" },
+  "payload": {
+    "iss": "https://UUID.tokens.sts.global.api.aws",
+    "sub": "arn:aws:iam::123456789012:role/<the pod's IAM role>",
+    "aud": "123456789012",
+    "exp": 1234567890,
+    "iat": 1234564290,
+    "https://sts.amazonaws.com/": { "aws_account": "123456789012", "org_id": "o-...", "...": "..." }
+  }
+}
 ```
+
+The JWKS document fetched in step 4 (`https://UUID.tokens.sts.global.api.aws/.well-known/jwks.json`) holds the AWS public keys, for example `{"keys": [{"kid": "abcd1234...", "kty": "EC", "use": "sig", "crv": "P-384", "x": "...", "y": "..."}]}`.
+
+**Key points:**
+
+- No API keys or secrets are stored anywhere.
+- AWS credentials are managed automatically by EKS Pod Identity.
+- JWT tokens are short-lived (15–60 minutes) and refreshed automatically.
+- Token validation uses the standard OIDC/OAuth flow.
+- Identity pools map token claims to Kafka permissions.
+- The Kafka client handles all authentication transparently.
 
 ## Before You Begin
 
@@ -510,9 +336,16 @@ After creating the provider:
 2. Go to **Identity pools** tab
 3. Click **Add pool**
 4. Configure the pool:
-   - **Pool ID:** `{YOUR_AWS_ACCOUNT_ID}` (same as your AWS account ID)
+   - **Name:** `aws-eks-producer` (any descriptive name; Confluent Cloud generates the pool ID, for example `pool-AbC1`)
    - **Description:** `AWS IAM credentials for EKS pods`
-   - **Filter:** `true` (for development purposes; for production you would want to set filters such as `{claims.sub == "abc"}`)
+   - **Identity claim:** `claims.sub`
+   - **Filter:** pin the exact IAM role the pod runs as. The token's `sub` claim is that role's ARN:
+
+     ```text
+     claims.sub == "arn:aws:iam::{YOUR_AWS_ACCOUNT_ID}:role/ConfluentProducerRole"
+     ```
+
+     `ConfluentProducerRole` is the role `setup-aws.sh` creates. A filter of `true` accepts every token from your AWS account's issuer; use it only for a quick test.
 
 ### 2.4 Grant Permissions to Identity Pool
 
@@ -675,9 +508,11 @@ Confluent Cloud Producer with AWS IAM Authentication
    - Format: `12345678-1234-1234-1234-123456789abc` (hyphenated)
 
 2. **AWS Account ID (from Step 2.1)** - Used for:
-   - Identity Pool ID in Confluent Cloud (must match exactly)
-   - ConfigMap `AWS_ACCOUNT_ID` setting
+   - ConfigMap `AWS_ACCOUNT_ID` setting (the producer uses it as the token audience, `aud`)
+   - The role ARN in the identity pool filter (`arn:aws:iam::{ACCOUNT_ID}:role/ConfluentProducerRole`)
    - Format: `123456789012` (12 digits, no hyphens)
+
+The identity pool ID itself is generated by Confluent Cloud (`pool-xxxx`); it is not your AWS account ID.
 
 **Do NOT mix these up!** The issuer URL uses the UUID, not the AWS account ID.
 
@@ -823,7 +658,7 @@ confluent iam pool create "AWS-Pool" \
   --provider <PROVIDER_ID> \
   --description "Identity pool for AWS IAM principals from EKS" \
   --identity-claim "claims.sub" \
-  --filter "true"
+  --filter 'claims.sub == "arn:aws:iam::{YOUR_AWS_ACCOUNT_ID}:role/ConfluentProducerRole"'
 
 # Note the pool ID (e.g., pool-xxxxx) from the output
 

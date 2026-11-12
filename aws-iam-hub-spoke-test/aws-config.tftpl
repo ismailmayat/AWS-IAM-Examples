@@ -1,0 +1,8 @@
+# Shipped in the function package; AWS_CONFIG_FILE points here.
+# credential_source = Environment: the source credentials for AssumeRole are
+# the Lambda execution role's (the "runtime role") environment credentials.
+[profile ${profile}]
+role_arn = ${hub_role_arn}
+credential_source = Environment
+role_session_name = ${session_name}
+region = ${region}

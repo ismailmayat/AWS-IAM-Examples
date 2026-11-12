@@ -1,0 +1,17 @@
+owner                    = "you@example.com"
+confluent_environment_id = "env-xxxxx"
+confluent_cluster_id     = "lkc-xxxxx"
+topic_name               = "test_topic"
+
+# Optional
+# aws_region        = "eu-west-1"
+# environment       = "dev"
+# workload          = "lambda-consumer"
+# consumer_group_id = "dev-lambda-consumer-hubtest"
+
+# Tags applied to every AWS resource (provider default_tags)
+# tags = {
+#   project     = "confluent-oauth-example"
+#   environment = "dev"
+#   owner       = "team@example.com"
+# }

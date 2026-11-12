@@ -1,0 +1,21 @@
+entra_tenant_id          = "00000000-0000-0000-0000-000000000000"
+aws_region               = "us-west-2"
+# Existing Confluent identity provider for the tenant (see `confluent iam provider list`)
+confluent_identity_provider_id = "op-xxxx"
+
+confluent_environment_id = "env-xxxxx"
+confluent_cluster_id     = "lkc-xxxxx"
+topic_name               = "test_topic"
+
+# Optional
+# name_prefix       = "cc-entra-consumer"
+# consumer_group_id = "lambda-entra-consumer"
+# starting_position = "TRIM_HORIZON"
+# batch_size        = 100
+
+# Tags applied to every AWS resource (provider default_tags)
+# tags = {
+#   project     = "confluent-oauth-example"
+#   environment = "dev"
+#   owner       = "team@example.com"
+# }

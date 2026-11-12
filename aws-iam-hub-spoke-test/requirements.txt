@@ -1,0 +1,3 @@
+confluent-kafka==2.16.1
+# Bundled because sts.get_web_identity_token needs a recent boto3
+boto3==1.44.1
