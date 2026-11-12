@@ -44,6 +44,12 @@ variable "topic_name" {
   type = string
 }
 
+variable "enable_esm_test" {
+  description = "Also deploy the ESM variant (Lambda native Kafka trigger with IAM_OAUTHBEARER_AUTH). Expected to fail authentication against the hub pool."
+  type        = bool
+  default     = false
+}
+
 variable "consumer_group_id" {
   type    = string
   default = "dev-lambda-consumer-hubtest"
